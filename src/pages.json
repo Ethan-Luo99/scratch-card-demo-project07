@@ -5,6 +5,14 @@
 			"style": {
 				"navigationBarTitleText": "uni-app"
 			}
+		},
+		{
+			"path": "pages/scratch/index",
+			"style": {
+				"navigationBarTitleText": "刮奖",
+				"enablePullDownRefresh": false,
+				"disableScroll": true
+			}
 		}
 	],
 	"globalStyle": {
