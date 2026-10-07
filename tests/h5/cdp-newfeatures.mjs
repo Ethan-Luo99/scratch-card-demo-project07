@@ -627,16 +627,11 @@ async function testIdempotentRapid(client) {
 
 async function testPrizeFail(client) {
   await client.send('Page.navigate', { url: PAGE + '?scenario=prizeFail' })
-  // 连刮活动：失败文案按期次展示（第 1 张奖品加载失败）；轮询等待失败态。
-  let failed = false
-  for (let i = 0; i < 30; i++) {
-    await sleep(200)
-    failed = await client.eval(() => {
-      const txt = document.body.innerText || ''
-      return txt.includes('奖品加载失败') && !document.getElementById('scratchCanvas')
-    })
-    if (failed) break
-  }
+  await sleep(1500)
+  const failed = await client.eval(() => {
+    const txt = document.body.innerText || ''
+    return txt.includes('奖品加载失败') && !document.getElementById('scratchCanvas')
+  })
   record('T13 奖品拉取失败进 Failed 态且无涂层可刮', failed,
     failed ? '' : '未显示失败态或 canvas 仍存在')
 }
@@ -723,6 +718,185 @@ async function testSettleFail(client) {
     `remain=${JSON.stringify(queueAfterFlush)} complete=${finalComplete}`)
 }
 
+
+async function testProgressPreserve(client) {
+  await client.eval(() => {
+    const r = window.__h.rectOf()
+    for (let y = 8; y < r.height * 0.2; y += 13) {
+      window.__h.strokePath(
+        [{ x: r.left + 6, y: r.top + y }, { x: r.left + r.width - 6, y: r.top + y }], 6)
+    }
+  })
+  await sleep(400)
+  const before = await client.eval(() => ({
+    canvas: window.__h.stats(), ratio: window.__scratchRatio || 0,
+  }))
+  const exported = await client.eval(async () => {
+    const btn = [...document.querySelectorAll('uni-button,button')]
+      .find((b) => (b.textContent || '').includes('模拟画布回收'))
+    if (!btn) return false
+    btn.click()
+    return true
+  })
+  await sleep(600)
+  let alive = false
+  for (let i = 0; i < 30; i++) {
+    alive = await client.eval(() => {
+      const c = window.__h.realCanvas()
+      return !!(c && c.width > 0)
+    })
+    if (alive) break
+    await sleep(150)
+  }
+  const after = await client.eval(() => ({
+    canvas: window.__h.stats(),
+    ratio: window.__scratchRatio || 0,
+    exists: !!document.getElementById('scratchCanvas'),
+  }))
+  const dClean = Math.abs(after.canvas.cleanRatio - before.canvas.cleanRatio)
+  record('P1 位图恢复：刮开像素不回退',
+    exported && alive && after.exists && dClean < 0.02,
+    `cleanRatio ${(before.canvas.cleanRatio*100).toFixed(1)}% -> ${(after.canvas.cleanRatio*100).toFixed(1)}% d=${dClean.toFixed(4)}`)
+  record('P2 恢复后 engine ratio 不回退',
+    after.ratio >= before.ratio - 0.02,
+    `ratio ${before.ratio.toFixed(3)} -> ${after.ratio.toFixed(3)}`)
+  record('P3 恢复不误触发揭晓',
+    after.exists && before.ratio < 0.5 && after.ratio < 0.5,
+    `ratio=${after.ratio.toFixed(3)} exists=${after.exists}`)
+  await client.eval(() => {
+    const r = window.__h.rectOf()
+    for (let y = 8; y < r.height - 8; y += 13) {
+      window.__h.strokePath(
+        [{ x: r.left + 4, y: r.top + y }, { x: r.left + r.width - 4, y: r.top + y + 4 }], 5)
+    }
+  })
+  let revealed2 = false
+  for (let i = 0; i < 40; i++) {
+    await sleep(100)
+    if (!(await client.eval(() => !!document.getElementById('scratchCanvas')))) { revealed2 = true; break }
+  }
+  record('P4 恢复后续刮仍可正常达标揭晓', revealed2, revealed2 ? '' : '未揭晓')
+}
+
+async function testExportFailFallback(client) {
+  await client.eval(() => {
+    const r = window.__h.rectOf()
+    for (let y = 8; y < r.height * 0.2; y += 13) {
+      window.__h.strokePath(
+        [{ x: r.left + 6, y: r.top + y }, { x: r.left + r.width - 6, y: r.top + y }], 6)
+    }
+  })
+  await sleep(400)
+  const before = await client.eval(() => ({ ratio: window.__scratchRatio || 0 }))
+  await client.eval(() => {
+    ;[...document.querySelectorAll('uni-button,button')]
+      .find((b) => (b.textContent || '').includes('模拟导出失败')).click()
+  })
+  await sleep(100)
+  await client.eval(() => {
+    ;[...document.querySelectorAll('uni-button,button')]
+      .find((b) => (b.textContent || '').includes('模拟画布回收')).click()
+  })
+  await sleep(800)
+  let alive = false
+  for (let i = 0; i < 30; i++) {
+    alive = await client.eval(() => { const c = window.__h.realCanvas(); return !!(c && c.width > 0) })
+    if (alive) break
+    await sleep(150)
+  }
+  const after = await client.eval(() => ({
+    ratio: window.__scratchRatio || 0, exists: !!document.getElementById('scratchCanvas'),
+  }))
+  const full = await client.eval(() => window.__h.stats())
+  record('F1 导出失败静默降级新卡：ratio 归零、节点存活',
+    alive && after.exists && after.ratio === 0,
+    `ratio ${before.ratio.toFixed(3)} -> ${after.ratio.toFixed(3)} alive=${alive}`)
+  record('F2 降级后为完整未刮涂层（cleanRatio≈0）',
+    full.exists && full.cleanRatio < 0.01,
+    `cleanRatio=${(full.cleanRatio*100).toFixed(2)}%`)
+}
+
+async function scratchFull(client) {
+  await ensureHelpers(client)
+  await client.eval(() => {
+    const r = window.__h.rectOf()
+    for (let y = 6; y < r.height - 6; y += 12) {
+      window.__h.strokePath(
+        [{ x: r.left + 4, y: r.top + y }, { x: r.left + r.width - 4, y: r.top + y }], 5)
+    }
+  })
+  for (let i = 0; i < 50; i++) {
+    await sleep(100)
+    if (!(await client.eval(() => !!document.getElementById('scratchCanvas')))) return true
+  }
+  return false
+}
+
+async function waitCardCover(client, tries = 60) {
+  for (let i = 0; i < tries; i++) {
+    const ok = await client.eval(() => {
+      const c = window.__h.realCanvas()
+      if (!c || !c.width) return false
+      const d = c.getContext('2d').getImageData(0,0,c.width,c.height).data
+      let op=0; for (let k=3;k<d.length;k+=4) if(d[k]>=120) op++
+      return op/(d.length/4) > 0.99
+    })
+    if (ok) return true
+    await sleep(150)
+  }
+  return false
+}
+
+async function testStreak(client) {
+  for (let period = 1; period <= 3; period++) {
+    const ready = await waitCardCover(client)
+    record('S' + period + 'ready 第 ' + period + ' 张重新走 Loading→Idle 出涂层', ready, '')
+    const revealed = await scratchFull(client)
+    record('S' + period + ' 第 ' + period + ' 张刮开揭晓', revealed, `period=${period}`)
+    if (period < 3) {
+      let nextReady = false
+      for (let i = 0; i < 30; i++) {
+        await sleep(100)
+        if (await waitCardCover(client, 1)) { nextReady = true; break }
+      }
+      record('S' + period + 'a 结算 800ms 后自动挂载第 ' + (period+1) + ' 张', nextReady, '')
+    }
+  }
+  await sleep(1200)
+  const finished = await client.eval(() => ({
+    noCanvas: !document.getElementById('scratchCanvas'),
+    text: document.body.innerText || '',
+  }))
+  record('S4 三张刮完显示活动结束态',
+    finished.noCanvas && finished.text.includes('活动已结束'),
+    finished.text.replace(/\s+/g, ' ').slice(0, 50))
+}
+
+async function testPrizeFail2(client) {
+  const revealed1 = await scratchFull(client)
+  record('PF1 第 1 期正常揭晓', revealed1, '')
+  await sleep(1400)
+  const failedUi = await client.eval(() => document.body.innerText || '')
+  record('PF2 第 2 期拉取失败：活动暂停、显示重试当前期',
+    failedUi.includes('第 2 张奖品加载失败') && failedUi.includes('重试第 2 张'),
+    failedUi.replace(/\s+/g,' ').slice(0,60))
+  const settled1 = await client.eval(() => !!localStorage.getItem('scratch_settled_8801:1'))
+  record('PF3 已完成第 1 期结算状态不受第 2 期失败影响', settled1, '')
+  // 去掉失败条件后点「重试第 2 张」：只重发当前期
+  await client.eval(() => {
+    const h = location.hash
+    const qi = h.indexOf('?')
+    location.hash = (qi >= 0 ? h.slice(0, qi) : h) + '?scenario=streak'
+  })
+  await sleep(200)
+  await client.eval(() => {
+    ;[...document.querySelectorAll('uni-button,button')]
+      .find((b) => (b.textContent||'').includes('重试第 2 张')).click()
+  })
+  const cardReady = await waitCardCover(client, 40)
+  record('PF4 重试只重发第 2 期：恢复出可刮卡片（期次不跳到 3）', cardReady, '')
+}
+
 /* ---------------- 主流程 ---------------- */
 
 async function withFreshPage(run, suffix = '') {
@@ -763,6 +937,30 @@ async function main() {
   if (want('T15')) {
     const { client: c15 } = await newPage()
     await testSettleFail(c15)
+  }
+  if (want('PROGRESS')) {
+    const { client } = await newPage()
+    await loadScratchPage(client, '?scenario=progress')
+    await ensureHelpers(client)
+    await testProgressPreserve(client)
+  }
+  if (want('EXPORTFAIL')) {
+    const { client } = await newPage()
+    await loadScratchPage(client, '?scenario=exportFail')
+    await ensureHelpers(client)
+    await testExportFailFallback(client)
+  }
+  if (want('STREAK')) {
+    const { client } = await newPage()
+    await loadScratchPage(client, '?scenario=streak')
+    await ensureHelpers(client)
+    await testStreak(client)
+  }
+  if (want('PRIZEFAIL2')) {
+    const { client } = await newPage()
+    await loadScratchPage(client, '?scenario=prizeFail2')
+    await ensureHelpers(client)
+    await testPrizeFail2(client)
   }
   if (want('T13')) {
     const { client } = await newPage()

@@ -35,7 +35,7 @@
     "build:quickapp-webview-huawei": "uni build -p quickapp-webview-huawei",
     "build:quickapp-webview-union": "uni build -p quickapp-webview-union",
     "type-check": "vue-tsc --noEmit",
-    "test:engine": "node --test tests/scratchEngine.test.ts"
+    "test:engine": "node --test tests/scratchEngine.test.ts tests/recoveryPolicy.test.ts tests/scratchStreak.test.ts"
   },
   "dependencies": {
     "@dcloudio/uni-app": "3.0.0-5020420260813003",

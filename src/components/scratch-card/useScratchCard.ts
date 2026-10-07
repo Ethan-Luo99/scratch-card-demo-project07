@@ -13,7 +13,13 @@
 import { onBeforeUnmount, ref, shallowRef, type Ref } from 'vue'
 import { createScratchEngine, shouldReveal } from './scratchEngine'
 import { platformAdapter, toCanvasPoint } from './platformAdapter'
+import {
+  decideRecoveryTier,
+  fallbackAfterRestoreFailure,
+  tierAfterReplayUnavailable,
+} from './recoveryPolicy'
 import type {
+  BitmapSnapshot,
   CanvasSurface,
   GridSnapshot,
   MeasuredRect,
@@ -71,6 +77,12 @@ export function useScratchCard(options: UseScratchCardOptions) {
   let revealTimer: ReturnType<typeof setTimeout> | null = null
   let disposed = false
   let initialized = false
+  // 进度保留：onHide 导出的位图快照 + 导出尝试标记（三级兜底决策用）。
+  let bitmapSnapshot: BitmapSnapshot | null = null
+  let exportAttempted = false
+  let pendingExport: Promise<BitmapSnapshot | null> | null = null
+  // H5 自测钩子：置 true 时下一次位图导出强制失败（验证静默降级）。
+  let debugForceExportFail = false
 
   function isInteractive(): boolean {
     return (
@@ -189,13 +201,7 @@ export function useScratchCard(options: UseScratchCardOptions) {
         return
       }
       surface.value = s
-      engine = createScratchEngine({
-        width: cssWidth,
-        height: cssHeight,
-        brushRadius: brushRadiusPx,
-        cols: options.gridCols.value,
-        rows: options.gridRows.value,
-      })
+      rebuildEngine()
       await s.paintCover(options.coverColor.value, options.coverImage.value)
       canvasHidden.value = false
       fadeOut.value = false
@@ -228,6 +234,7 @@ export function useScratchCard(options: UseScratchCardOptions) {
   function retry(): void {
     status.value = 'loading'
     ready.value = false
+    clearBitmapSnapshot()
     void init()
   }
 
@@ -361,29 +368,100 @@ export function useScratchCard(options: UseScratchCardOptions) {
     }
   }
 
-  /* ---------------- onHide / onShow 异常转移（§8.3 / 约束 2.6） ---------------- */
+  /* ---------------- onHide / onShow 异常转移（§8.3 / 本轮进度保留升级） ---------------- */
 
-  /** 刮卡中切后台：停 rAF、结束当前笔画，防止回前台贯穿长线。 */
+  function clearBitmapSnapshot(): void {
+    bitmapSnapshot = null
+    exportAttempted = false
+    pendingExport = null
+  }
+
+  /** 按当前尺寸/笔刷重建引擎（与 init 路径同口径）。 */
+  function rebuildEngine(): void {
+    engine = createScratchEngine({
+      width: cssWidth,
+      height: cssHeight,
+      brushRadius: brushRadiusPx,
+      cols: options.gridCols.value,
+      rows: options.gridRows.value,
+    })
+  }
+
+  /**
+   * 重置为新卡（静默降级终态 / 尺寸变化）：
+   * 重绘涂层 + 重建引擎（不能只 reset：resume 后 surface 已换新实例，
+   * 旧引擎的 ratio 单调快照会在下一帧采样时把进度「写回」）。
+   */
+  async function resetToFreshCover(ns: CanvasSurface): Promise<void> {
+    await ns.paintCover(options.coverColor.value, options.coverImage.value)
+    rebuildEngine()
+    ratio.value = 0
+    dirty = false
+    lastSnapshot = null
+    if (status.value === 'scratching') status.value = 'idle'
+    // 向外同步归零（页面埋点/自验窗口钩子），避免外部仍显示旧进度。
+    options.onProgress?.(0)
+  }
+
+  /**
+   * 刮卡中切后台：
+   * - 停 rAF、结束当前笔画，防止回前台贯穿长线；
+   * - 进度保留升级：把当前 canvas 位图导出到内存
+   *   （H5 toDataURL；MP-WEIXIN / APP-PLUS 2D 节点 canvasToTempFilePath({canvas})）。
+   * 导出全程静默：失败只置标记，onShow 时按三级兜底降级，不报错、不留脏状态。
+   */
   function pause(): void {
     stopLoop()
     engine.endStroke()
     activeIdentifier = null
+    const s = surface.value
+    // 揭晓态/无 surface 不导出：揭晓结果由下层奖品 view 承载，无需位图。
+    if (!s || (status.value !== 'idle' && status.value !== 'scratching')) return
+    bitmapSnapshot = null
+    exportAttempted = true
+    // runBitmapExport 内部已吞错；理论上不会 reject，catch 仅作静默保险。
+    try {
+      pendingExport = runBitmapExport(s)
+    } catch {
+      /* 静默：无快照时恢复策略自动降级 fresh */
+    }
+  }
+
+  async function runBitmapExport(
+    s: CanvasSurface,
+  ): Promise<BitmapSnapshot | null> {
+    let snapshot: BitmapSnapshot | null = null
+    try {
+      snapshot = debugForceExportFail ? null : await s.exportBitmap()
+    } catch {
+      snapshot = null
+    }
+    // 导出成功的唯一标志是持有快照；失败保持 bitmapSnapshot=null，
+    // 恢复策略据 exportAttempted && !snapshot 判定为 fresh 降级。
+    if (snapshot) bitmapSnapshot = snapshot
+    return snapshot
   }
 
   /**
-   * 回前台：重查 rect。
-   * - node 存活且尺寸未变：位图仍在，直接续刮；
-   * - node 失效/尺寸为 0（画布被回收）：重新 mount、重绘涂层、按内存网格重放已擦区域；
-   * - 布局尺寸变化（旋转/分屏）：重设物理像素后位图清空，重绘并重置网格（T29 场景）。
-   */
-  /**
-   * 回前台（约束 2.6）：
+   * 回前台（进度保留升级）：
    * - 先重查 rect；node 存活且尺寸未变：位图仍在，直接续刮。
-   * - node 失效/尺寸为 0（画布被回收）：重新 mount、重绘涂层，并按内存网格重放已擦区域。
-   * - 布局尺寸变化（旋转/分屏）：按新尺寸重建设备与网格（旧网格坐标失效，等同换卡）。
+   * - 布局尺寸变化（旋转/分屏）：坐标系改变，按新尺寸重建并重置为新卡。
+   * - node 失效/尺寸为 0（画布被回收）：重新 mount 后按三级兜底恢复——
+   *   1. 位图可用：drawImage 整体恢复（ratio/网格不回退、不误触发揭晓）；
+   *   2. 位图不可用（旧内核等）：buildReplayCommand 网格圆点重放（二级兜底）；
+   *   3. 导出失败或恢复失败：静默降级回「重置为新卡」（不报错、不留脏状态）。
    */
   async function resume(): Promise<void> {
     if (disposed || !initialized) return
+    // 等 onHide 已发起的导出落定（不阻塞 node 存活的快路径判空之外的逻辑）。
+    if (pendingExport) {
+      try {
+        await pendingExport
+      } catch {
+        /* 静默 */
+      }
+      pendingExport = null
+    }
     let measured: MeasuredRect
     try {
       measured = await platformAdapter.queryRect(
@@ -399,6 +477,8 @@ export function useScratchCard(options: UseScratchCardOptions) {
     rect = measured
 
     if (!recycled && !sizeChanged) {
+      // 节点位图仍在，导出的快照不再需要（避免持有 dataURL/临时文件引用）。
+      clearBitmapSnapshot()
       if (status.value === 'scratching' || status.value === 'idle') startLoop()
       return
     }
@@ -412,8 +492,9 @@ export function useScratchCard(options: UseScratchCardOptions) {
     const screenWidth = uni.getSystemInfoSync().windowWidth || targetW
     const targetBrush = (options.brushRadiusRpx.value * screenWidth) / 750
 
+    let ns: CanvasSurface
     try {
-      const ns = await platformAdapter.mount(options.canvasId, {
+      ns = await platformAdapter.mount(options.canvasId, {
         cssWidthPx: targetW,
         cssHeightPx: targetH,
         brushRadiusPx: targetBrush,
@@ -421,49 +502,82 @@ export function useScratchCard(options: UseScratchCardOptions) {
         gridRows: options.gridRows.value,
         instance: options.getInstance(),
       })
-      if (disposed) {
-        ns.dispose()
-        return
-      }
-      surface.value = ns
-      await ns.paintCover(options.coverColor.value, options.coverImage.value)
-      canvasHidden.value = false
-      fadeOut.value = false
-
-      if (sizeChanged) {
-        // 尺寸变化：坐标系改变，网格重置（等同发一张新卡）。
-        cssWidth = targetW
-        cssHeight = targetH
-        brushRadiusPx = targetBrush
-        engine = createScratchEngine({
-          width: cssWidth,
-          height: cssHeight,
-          brushRadius: brushRadiusPx,
-          cols: options.gridCols.value,
-          rows: options.gridRows.value,
-        })
-        ratio.value = 0
-        dirty = false
-        if (status.value === 'scratching') status.value = 'idle'
-      } else {
-        // 仅画布被回收：尺寸未变，按内存网格重放已擦除区域。
-        const replay = engine.buildReplayCommand()
-        if (replay) {
-          ns.erase(replay)
-          dirty = true
-          lastCheckAt = 0
-        }
-      }
-
-      if (status.value === 'revealed' || status.value === 'settled') {
-        ns.revealAll()
-        canvasHidden.value = true
-      }
-      startLoop()
     } catch (err) {
       console.error('[scratch-card] resume failed', err)
       status.value = 'failed'
+      return
     }
+    if (disposed) {
+      ns.dispose()
+      return
+    }
+    surface.value = ns
+    cssWidth = targetW
+    cssHeight = targetH
+    brushRadiusPx = targetBrush
+    canvasHidden.value = false
+    fadeOut.value = false
+
+    if (sizeChanged) {
+      // 尺寸变化：坐标系改变，位图/网格坐标均失效，等同发一张新卡。
+      // cssWidth/Height 已在前面更新，resetToFreshCover 内按新尺寸重建引擎。
+      await resetToFreshCover(ns)
+      clearBitmapSnapshot()
+      startLoop()
+      return
+    }
+
+    if (status.value === 'revealed' || status.value === 'settled') {
+      // 揭晓后画布回收：结果由下层奖品 view 展示，清空涂层即可，无需恢复位图。
+      ns.revealAll()
+      canvasHidden.value = true
+      clearBitmapSnapshot()
+      startLoop()
+      return
+    }
+
+    // 画布被回收且尺寸未变：位图恢复 → 网格重放 → 重置新卡（三级兜底，纯逻辑决策）。
+    let tier = decideRecoveryTier({
+      legacy: Boolean(ns.legacy),
+      exportAttempted,
+      snapshot: bitmapSnapshot,
+    })
+    let replayCmd: ReturnType<typeof engine.buildReplayCommand> = null
+
+    if (tier === 'bitmap') {
+      const restored = bitmapSnapshot
+        ? await ns.restoreBitmap(bitmapSnapshot)
+        : false
+      if (!restored) {
+        // 位图恢复失败：按约束直接静默降级为重置新卡（不报错、不留脏状态）。
+        tier = fallbackAfterRestoreFailure()
+      }
+    } else if (tier === 'replay') {
+      await ns.paintCover(options.coverColor.value, options.coverImage.value)
+      replayCmd = engine.buildReplayCommand()
+      if (!replayCmd) {
+        // 网格也无进度可重放：等同新卡。
+        tier = tierAfterReplayUnavailable()
+      }
+    }
+
+    if (tier === 'fresh') {
+      await resetToFreshCover(ns)
+      clearBitmapSnapshot()
+      startLoop()
+      return
+    }
+
+    if (tier === 'replay' && replayCmd) {
+      ns.erase(replayCmd)
+    }
+    // tier === 'bitmap' 已整体 drawImage 恢复。
+    // 恢复成功：ratio 与网格保持 onHide 前状态（单调不回退），下一笔采样自然校准，
+    // 恢复路径本身不做揭晓判定（杜绝误触发）。
+    dirty = true
+    lastCheckAt = 0
+    clearBitmapSnapshot()
+    startLoop()
   }
 
   function setFailed(): void {
@@ -479,6 +593,45 @@ export function useScratchCard(options: UseScratchCardOptions) {
     surface.value = null
   })
 
+  /**
+   * H5 自验：模拟「onHide 导出位图后 canvas 节点被回收」。
+   * 停循环 + 导出位图 + 销毁旧 surface（节点位图随之丢失），随后可调用 resume() 验证恢复。
+   */
+  // #ifdef H5
+  async function debugSimulateRecycled(): Promise<void> {
+    const s = surface.value
+    if (!s) return
+    pause()
+    if (pendingExport) {
+      try {
+        await pendingExport
+      } catch {
+        /* 静默 */
+      }
+      pendingExport = null
+    }
+    stopLoop()
+    s.dispose()
+    surface.value = null
+    // H5 节点仍在 DOM 中：置空物理尺寸模拟回收（isAlive() 为 false）。
+    const host = document.getElementById(options.canvasId)
+    const inner =
+      host && host.tagName === 'CANVAS'
+        ? (host as HTMLCanvasElement)
+        : host
+          ? host.querySelector('canvas')
+          : null
+    if (inner) {
+      inner.width = 0
+      inner.height = 0
+    }
+  }
+
+  function debugSetExportFail(on: boolean): void {
+    debugForceExportFail = on
+  }
+  // #endif
+
   return {
     status,
     ratio,
@@ -492,6 +645,12 @@ export function useScratchCard(options: UseScratchCardOptions) {
     markSettled,
     pause,
     resume,
+    ...({
+      // #ifdef H5
+      debugSimulateRecycled,
+      debugSetExportFail,
+      // #endif
+    } as Record<string, unknown>),
     normalizeAndHandle,
     onMouseDown(e: TouchEventLike): void {
       onTouchStart(e, 0)

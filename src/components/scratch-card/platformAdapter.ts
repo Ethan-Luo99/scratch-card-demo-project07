@@ -9,6 +9,7 @@
  */
 
 import type {
+  BitmapSnapshot,
   CanvasSurface,
   DomRectLike,
   EraseCommand,
@@ -73,6 +74,8 @@ interface NodeSurfaceInjects {
   loadImage(src: string): Promise<CanvasImageSource>
   scheduleFrame(cb: (time: number) => void): number
   cancelFrame(handle: number): void
+  /** onHide 导出涂层位图；不支持/失败返回 null，实现内部静默吞错 */
+  exportBitmap(canvas: NodeCanvas): Promise<BitmapSnapshot | null>
 }
 
 function createNodeSurface(
@@ -192,6 +195,35 @@ function createNodeSurface(
       if (autoScale) ctx.setTransform(1, 0, 0, 1, 0, 0)
       ctx.clearRect(0, 0, w, h)
       if (autoScale) ctx.scale(dpr, dpr)
+    },
+
+    async exportBitmap(): Promise<BitmapSnapshot | null> {
+      try {
+        return await injects.exportBitmap(canvas)
+      } catch {
+        // 静默：调用方按三级兜底降级（recoveryPolicy）。
+        return null
+      }
+    },
+
+    async restoreBitmap(snapshot: BitmapSnapshot): Promise<boolean> {
+      const src = snapshot.kind === 'dataURL' ? snapshot.data : snapshot.path
+      try {
+        const img = await injects.loadImage(src)
+        // 与 paintCover 相同的变换口径，保证导出/恢复物理像素 1:1。
+        ctx.globalCompositeOperation = 'source-over'
+        ctx.globalAlpha = 1
+        if (autoScale) ctx.setTransform(1, 0, 0, 1, 0, 0)
+        ctx.clearRect(0, 0, w, h)
+        ctx.drawImage(img, 0, 0, w, h)
+        if (autoScale) ctx.scale(dpr, dpr)
+        // 复位擦除复合模式。
+        ctx.globalCompositeOperation = 'destination-out'
+        return true
+      } catch {
+        // 图片加载/绘制失败：静默，调用方降级为重置为新卡。
+        return false
+      }
     },
 
     scheduleFrame(cb: (time: number) => void): number {
@@ -320,6 +352,42 @@ function mountFromNode(
         }
       }
       clearTimeout(handle as unknown as ReturnType<typeof setTimeout>)
+    },
+
+    // 进度保留：2D 节点经 uni.canvasToTempFilePath({ canvas }) 导出物理位图到临时文件。
+    exportBitmap(targetNode: NodeCanvas): Promise<BitmapSnapshot | null> {
+      return new Promise((resolve) => {
+        const api = (
+          uni as unknown as {
+            canvasToTempFilePath?: (
+              o: {
+                canvas?: unknown
+                success?: (r: { tempFilePath?: string }) => void
+                fail?: () => void
+              },
+              inst?: unknown,
+            ) => void
+          }
+        ).canvasToTempFilePath
+        if (typeof api !== 'function') {
+          resolve(null)
+          return
+        }
+        try {
+          api.call(
+            uni,
+            {
+              canvas: targetNode,
+              success: (r) =>
+                resolve(r && r.tempFilePath ? { kind: 'tempFilePath', path: r.tempFilePath } : null),
+              fail: () => resolve(null),
+            },
+            opts.instance,
+          )
+        } catch {
+          resolve(null)
+        }
+      })
     },
   }, true /* autoScale：MP/App 2D 节点 */)
 }
@@ -460,6 +528,13 @@ function createLegacySurface(canvasId: string, opts: MountOpts, instance: unknow
       ctx.clearRect(0, 0, w, h)
       ;(ctx as unknown as { draw: (reserve: boolean, cb?: () => void) => void }).draw(false)
     },
+    async exportBitmap(): Promise<BitmapSnapshot | null> {
+      // 旧内核 createCanvasContext 分支无 2D 节点，位图导出不可用 → 网格圆点重放兜底。
+      return null
+    },
+    async restoreBitmap(): Promise<boolean> {
+      return false
+    },
     scheduleFrame(cb): number {
       return setTimeout(() => cb(Date.now()), FALLBACK_FRAME_MS) as unknown as number
     },
@@ -582,6 +657,19 @@ class ScratchPlatformAdapter implements PlatformAdapter {
           },
           cancelFrame(handle: number): void {
             window.cancelAnimationFrame(handle)
+          },
+          // 进度保留：H5 直接 toDataURL 导出物理像素位图（PNG 保留 alpha）。
+          exportBitmap(targetNode: NodeCanvas): Promise<BitmapSnapshot | null> {
+            return new Promise((resolve) => {
+              try {
+                const url = (
+                  targetNode as HTMLCanvasElement
+                ).toDataURL('image/png')
+                resolve(url ? { kind: 'dataURL', data: url } : null)
+              } catch {
+                resolve(null)
+              }
+            })
           },
         }, false /* autoScale：H5 由 uni hidpi 补丁处理，禁止再 scale */),
       )

@@ -169,6 +169,18 @@ defineExpose({
   setFailed: card.setFailed,
   status: card.status,
   ratio: card.ratio,
+  // #ifdef H5
+  debugSimulateRecycled: (
+    card as unknown as {
+      debugSimulateRecycled?: () => Promise<void>
+    }
+  ).debugSimulateRecycled,
+  debugSetExportFail: (
+    card as unknown as {
+      debugSetExportFail?: (on: boolean) => void
+    }
+  ).debugSetExportFail,
+  // #endif
 })
 </script>
 

@@ -117,6 +117,11 @@ export interface MountOpts {
   instance?: unknown
 }
 
+/** onHide 导出的涂层位图快照（仅内存、当前生命周期有效，不做持久化） */
+export type BitmapSnapshot =
+  | { kind: 'dataURL'; data: string }
+  | { kind: 'tempFilePath'; path: string }
+
 /** 涂层表面，屏蔽三端 canvas 差异 */
 export interface CanvasSurface {
   readonly logicalWidth: number
@@ -130,6 +135,18 @@ export interface CanvasSurface {
   sampleGrid(cols: number, rows: number): Uint8ClampedArray
   /** 整幅清空（fade 由组件用 CSS opacity 驱动；旧内核可直接隐藏节点） */
   revealAll(): void
+  /**
+   * onHide：导出当前涂层位图到内存。
+   * H5 走 canvas.toDataURL；MP-WEIXIN / APP-PLUS 2D 节点走
+   * uni.canvasToTempFilePath({ canvas: node })。
+   * 平台不支持或导出失败时返回 null（调用方静默降级），不得抛错。
+   */
+  exportBitmap(): Promise<BitmapSnapshot | null>
+  /**
+   * onShow：节点被回收重建后，用 drawImage 把位图整体画回新节点。
+   * 恢复失败（图片加载失败等）返回 false，调用方按「重置为新卡」静默降级。
+   */
+  restoreBitmap(snapshot: BitmapSnapshot): Promise<boolean>
   /** App 旧内核 createCanvasContext 回退分支标记（揭晓时需隐藏原生节点） */
   readonly legacy?: boolean
   /** rAF：MP 2D 用 node.requestAnimationFrame，H5 用全局 rAF，回退 setTimeout(16) */
