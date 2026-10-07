@@ -43,3 +43,29 @@ export function fallbackAfterRestoreFailure(): RecoveryTier {
 export function tierAfterReplayUnavailable(): RecoveryTier {
   return 'fresh'
 }
+
+/* ---------------- 会话边界（防串卡） ---------------- */
+
+/**
+ * 跨会话（持久化恢复）的恢复策略：一律 fresh。
+ * 位图/网格进度只在同一会话的 onShow 生效；刷新/杀进程重进后，
+ * 页面按期次状态发新卡新涂层，禁止把上一会话的位图或网格画到恢复出的期次上。
+ */
+export function recoveryForPersistedRestore(): RecoveryTier {
+  return 'fresh'
+}
+
+/**
+ * 位图快照的会话有效性：快照只在导出它的会话内可用于恢复。
+ * 会话标识不一致（或快照无会话标识）→ 快照必须丢弃，按无快照处理。
+ */
+export function isSnapshotInSession(
+  snapshotSession: string | null,
+  currentSession: string,
+): boolean {
+  return (
+    snapshotSession !== null &&
+    snapshotSession !== '' &&
+    snapshotSession === currentSession
+  )
+}

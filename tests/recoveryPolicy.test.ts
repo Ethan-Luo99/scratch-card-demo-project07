@@ -16,6 +16,8 @@ import assert from 'node:assert/strict'
 import {
   decideRecoveryTier,
   fallbackAfterRestoreFailure,
+  isSnapshotInSession,
+  recoveryForPersistedRestore,
   tierAfterReplayUnavailable,
   type RecoveryDecisionInput,
 } from '../src/components/scratch-card/recoveryPolicy.ts'
@@ -84,4 +86,15 @@ test('位图恢复失败 → fresh（不报错、不留脏状态）', () => {
 
 test('网格重放拿不到指令（无任何已擦格）→ fresh', () => {
   assert.equal(tierAfterReplayUnavailable(), 'fresh')
+})
+
+test('跨会话（持久化恢复）一律 fresh：禁止把上一会话位图/网格画到恢复期次上', () => {
+  assert.equal(recoveryForPersistedRestore(), 'fresh')
+})
+
+test('位图快照仅同会话有效：会话不一致/无标识 → 快照必须丢弃', () => {
+  assert.equal(isSnapshotInSession('s1', 's1'), true)
+  assert.equal(isSnapshotInSession('s1', 's2'), false, '跨会话快照不可用')
+  assert.equal(isSnapshotInSession(null, 's1'), false, '无会话标识不可用')
+  assert.equal(isSnapshotInSession('', 's1'), false)
 })

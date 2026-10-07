@@ -46,6 +46,8 @@ const props = withDefaults(
     gridCols?: number
     gridRows?: number
     disabled?: boolean
+    /** 页面会话标识：位图/网格进度仅同会话 onShow 可恢复 */
+    sessionId?: string
   }>(),
   {
     widthRpx: 750,
@@ -57,6 +59,7 @@ const props = withDefaults(
     gridCols: 25,
     gridRows: 14,
     disabled: false,
+    sessionId: '',
   },
 )
 
@@ -94,6 +97,7 @@ const imageRef = computed(() => props.coverImage)
 const colsRef = computed(() => props.gridCols)
 const rowsRef = computed(() => props.gridRows)
 const disabledRef = computed(() => props.disabled)
+const sessionIdRef = computed(() => props.sessionId)
 
 const card = useScratchCard({
   canvasId,
@@ -107,6 +111,7 @@ const card = useScratchCard({
   gridRows: rowsRef,
   disabled: disabledRef,
   prize: prizeRef,
+  sessionId: sessionIdRef,
   getInstance: () => instance?.proxy,
   onProgress: (r) => emit('progress', r),
   onScratchStart: () => emit('scratch-start'),

@@ -16,6 +16,7 @@ import { platformAdapter, toCanvasPoint } from './platformAdapter'
 import {
   decideRecoveryTier,
   fallbackAfterRestoreFailure,
+  isSnapshotInSession,
   tierAfterReplayUnavailable,
 } from './recoveryPolicy'
 import type {
@@ -43,6 +44,8 @@ export interface UseScratchCardOptions {
   prize: Ref<PrizeInfo | null>
   /** 逻辑层实例（小程序组件内 SelectorQuery 需要） */
   getInstance: () => unknown
+  /** 页面会话标识：位图/网格进度仅同会话 onShow 可恢复，跨会话一律发新卡 */
+  sessionId?: Ref<string>
   onProgress?: (ratio: number) => void
   onScratchStart?: () => void
   onComplete: (prize: PrizeInfo) => void
@@ -77,8 +80,8 @@ export function useScratchCard(options: UseScratchCardOptions) {
   let revealTimer: ReturnType<typeof setTimeout> | null = null
   let disposed = false
   let initialized = false
-  // 进度保留：onHide 导出的位图快照 + 导出尝试标记（三级兜底决策用）。
-  let bitmapSnapshot: BitmapSnapshot | null = null
+  // 进度保留：onHide 导出的位图快照（绑定会话标识）+ 导出尝试标记（三级兜底决策用）。
+  let bitmapSnapshot: { session: string; data: BitmapSnapshot } | null = null
   let exportAttempted = false
   let pendingExport: Promise<BitmapSnapshot | null> | null = null
   // H5 自测钩子：置 true 时下一次位图导出强制失败（验证静默降级）。
@@ -376,6 +379,15 @@ export function useScratchCard(options: UseScratchCardOptions) {
     pendingExport = null
   }
 
+  /** 仅同会话的位图快照可用；跨会话（持久化恢复）一律视为无快照 → 发新卡。 */
+  function sessionSnapshot(): BitmapSnapshot | null {
+    if (!bitmapSnapshot) return null
+    const session = options.sessionId ? options.sessionId.value : ''
+    return isSnapshotInSession(bitmapSnapshot.session, session)
+      ? bitmapSnapshot.data
+      : null
+  }
+
   /** 按当前尺寸/笔刷重建引擎（与 init 路径同口径）。 */
   function rebuildEngine(): void {
     engine = createScratchEngine({
@@ -438,7 +450,12 @@ export function useScratchCard(options: UseScratchCardOptions) {
     }
     // 导出成功的唯一标志是持有快照；失败保持 bitmapSnapshot=null，
     // 恢复策略据 exportAttempted && !snapshot 判定为 fresh 降级。
-    if (snapshot) bitmapSnapshot = snapshot
+    if (snapshot) {
+      bitmapSnapshot = {
+        session: options.sessionId ? options.sessionId.value : '',
+        data: snapshot,
+      }
+    }
     return snapshot
   }
 
@@ -537,16 +554,18 @@ export function useScratchCard(options: UseScratchCardOptions) {
     }
 
     // 画布被回收且尺寸未变：位图恢复 → 网格重放 → 重置新卡（三级兜底，纯逻辑决策）。
+    // 位图快照绑定会话标识：跨会话（持久化恢复）sessionSnapshot() 为 null → fresh。
+    const usableSnapshot = sessionSnapshot()
     let tier = decideRecoveryTier({
       legacy: Boolean(ns.legacy),
       exportAttempted,
-      snapshot: bitmapSnapshot,
+      snapshot: usableSnapshot,
     })
     let replayCmd: ReturnType<typeof engine.buildReplayCommand> = null
 
     if (tier === 'bitmap') {
-      const restored = bitmapSnapshot
-        ? await ns.restoreBitmap(bitmapSnapshot)
+      const restored = usableSnapshot
+        ? await ns.restoreBitmap(usableSnapshot)
         : false
       if (!restored) {
         // 位图恢复失败：按约束直接静默降级为重置新卡（不报错、不留脏状态）。
