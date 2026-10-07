@@ -74,6 +74,27 @@ import {
   type SettleRecord,
   type StreakState,
 } from './scratchStreak'
+import {
+  ACTIVITY_STATE_KEY,
+  SETTLE_QUEUE_KEY,
+  FallbackStorage,
+  createActivityState,
+  parseActivityState,
+  serializeActivityState,
+  markPeriodRevealed,
+  markPeriodSettled,
+  setActivityPeriod,
+  deriveStreakState,
+  revealedPeriods,
+  prizePeriodMapper,
+  migrateLegacyStorage,
+  hasSettleFlag,
+  legacySettleFlagKey,
+  SettleCoordinator,
+  EpochGuard,
+  type ActivityStateV1,
+  type ActivityStorageLike,
+} from './scratchActivity'
 
 /**
  * 页面职责（对齐 01 §2）：生命周期、拉奖品、传给组件、监听 complete 结算/上报、异常态 UI。
@@ -84,17 +105,49 @@ import {
  * - 幂等键 prizeId+期次：补偿队列、结算幂等标记、completeCount 全部按期次区分；
  * - 任一期 Failed：活动暂停，重试只重发当前期次，不影响已完成期次结算状态。
  *
+ * 断点续刮升级：
+ * - 活动状态（当前期次、每期 revealed/settled）持久化，刷新/杀进程重进恢复到正确期次；
+ * - 旧数据迁移（旧幂等标记/旧队列记录）幂等可重入，中断重跑不重复、不丢失、不算错期次；
+ * - storage 写失败静默降级纯内存模式，活动可完整刮完，重进按无历史处理；
+ * - 跨会话恢复一律发新卡新涂层（位图/网格恢复仅限同会话 onShow，组件快照不持久化）；
+ * - 结算竞态：SettleCoordinator 保证同一 (prizeId, 期次) 恰好生效一次，
+ *   EpochGuard 丢弃过期拉取响应。
+ *
  * 奖品/结算接口为后端接入点：当前以本地 mock 实现（零依赖、可在无后端下自验），
  * 真机接入时把 fetchPrize / reportSettlement 替换为 uni.request 即可。
  */
 
-const SETTLE_QUEUE_KEY = 'scratch_settle_queue'
-
 const streakTotal = STREAK_TOTAL
 const prizePool = buildLocalPrizePool()
 const completeGuard = new PeriodCompleteGuard()
+const settleCoordinator = new SettleCoordinator()
+const fetchEpoch = new EpochGuard()
+
+/**
+ * uni 存储适配器（读/写异常由 FallbackStorage 静默兜底，降级纯内存模式）。
+ * H5 自测：?scenario=storageFail 时 set 抛错，验证降级路径。
+ */
+const uniStorage: ActivityStorageLike = {
+  get(key: string): string | null {
+    const v = uni.getStorageSync(key)
+    return v === '' || v === null || v === undefined ? null : String(v)
+  },
+  set(key: string, value: string): void {
+    // #ifdef H5
+    if (readScenarioFromLocation() === 'storageFail') {
+      throw new Error('mock QuotaExceededError')
+    }
+    // #endif
+    uni.setStorageSync(key, value)
+  },
+  keys(): string[] {
+    return (uni.getStorageInfoSync().keys || []) as string[]
+  },
+}
+const storage = new FallbackStorage(uniStorage)
 
 const streak = ref<StreakState>(createStreakState())
+const activityState = ref<ActivityStateV1>(createActivityState())
 const prize = ref<PrizeInfo | null>(null)
 const cardRef = ref<InstanceType<typeof ScratchCard> | null>(null)
 const completeCounts = ref<Record<number, number>>({})
@@ -111,7 +164,8 @@ onMounted(() => {
   const scenario = readScenarioFromLocation()
   debugScenario.value = scenario
   // #endif
-  void mountCurrentPeriod()
+  restoreActivity()
+  if (streak.value.stage !== 'finished') void mountCurrentPeriod()
   void flushSettleQueue()
   // #ifndef H5
   uni.onNetworkStatusChange((res) => {
@@ -136,6 +190,36 @@ onHide(() => {
 
 /* ---------------- 期次流转（活动状态机） ---------------- */
 
+function persistActivityState(): void {
+  // 写失败由 FallbackStorage 静默降级，绝不阻断活动流程。
+  storage.set(ACTIVITY_STATE_KEY, serializeActivityState(activityState.value))
+}
+
+/**
+ * 断点恢复：旧数据迁移（幂等可重入）→ 读快照 → 推导期次。
+ * 已完成期次预置 completeGuard / SettleCoordinator：不重刮、不重结算、不重复入队。
+ * 跨会话恢复只恢复「期次状态」，涂层一律新发（位图/网格恢复仅限同会话 onShow）。
+ */
+function restoreActivity(): void {
+  try {
+    migrateLegacyStorage(storage, prizePeriodMapper(prizePool))
+  } catch (err) {
+    // FallbackStorage 已吞写错误；此处仅防御未知异常，按无历史继续。
+    console.error('[scratch page] migration failed, continue without history', err)
+  }
+  const restored = parseActivityState(storage.get(ACTIVITY_STATE_KEY))
+  if (!restored) return
+  activityState.value = restored
+  for (const period of revealedPeriods(restored)) {
+    completeGuard.mark(period)
+    const p = restored.periods[String(period)]
+    if (p && p.prizeId !== null && p.settled) {
+      settleCoordinator.markDone(settleKey(p.prizeId, period))
+    }
+  }
+  streak.value = deriveStreakState(restored)
+}
+
 function setStage(stage: StreakState['stage']): void {
   const next = transitionStreak(streak.value, stage)
   if (next) streak.value = next
@@ -149,14 +233,19 @@ async function mountCurrentPeriod(): Promise<void> {
   }
   setStage('loading')
   prize.value = null
+  activityState.value = setActivityPeriod(activityState.value, streak.value.period)
+  persistActivityState()
+  // 纪元令牌：慢响应/旧重试返回时若已发起新一轮，一律丢弃，不污染当前期。
+  const epoch = fetchEpoch.next()
   try {
     const data = await fetchPrize(streak.value.period)
-    // 仅接受当前期的结果，防止旧期重试/慢响应覆盖新期。
+    if (!fetchEpoch.isCurrent(epoch)) return
     // 字段异常兜底：无 title 按「谢谢参与」处理（§8.3）。
     prize.value =
       data && data.title ? data : { id: data?.id ?? 0, title: '谢谢参与' }
     setStage('ready')
   } catch (err) {
+    if (!fetchEpoch.isCurrent(epoch)) return
     console.error('[scratch page] fetch prize failed', err)
     prize.value = null
     // 任一期 Failed：活动暂停（不清空已完成期次的结算/补偿状态）。
@@ -243,8 +332,8 @@ function reportSettlement(record: SettleRecord): Promise<void> {
 
 function readQueue(): SettleRecord[] {
   try {
-    const raw = uni.getStorageSync(SETTLE_QUEUE_KEY)
-    const arr = raw ? (JSON.parse(raw as string) as SettleRecord[]) : []
+    const raw = storage.get(SETTLE_QUEUE_KEY)
+    const arr = raw ? (JSON.parse(raw) as SettleRecord[]) : []
     return Array.isArray(arr) ? arr : []
   } catch {
     return []
@@ -252,22 +341,47 @@ function readQueue(): SettleRecord[] {
 }
 
 function writeQueue(records: SettleRecord[]): void {
-  uni.setStorageSync(SETTLE_QUEUE_KEY, JSON.stringify(records))
+  // 写失败静默降级（FallbackStorage 内存镜像仍保留本会话记录）。
+  storage.set(SETTLE_QUEUE_KEY, JSON.stringify(records))
 }
 
 /**
  * 补报队列：幂等键为 prizeId+期次；补报成功再写该期幂等标记，
  * 保证「同一条记录无论走直报还是补偿，服务端/本地恰好生效一次」。
+ * 与直报并发时由 SettleCoordinator 互斥；已生效记录直接出队不重复上报。
+ * 旧版无期次记录（period=0）原样补报，成功后写回旧式标记，不丢失、不错判期次。
  */
 async function flushSettleQueue(): Promise<void> {
   const pending = readQueue()
   if (pending.length === 0) return
   const remain: SettleRecord[] = []
   for (const record of pending) {
+    const knownPeriod = record.period >= 1
+    const key = knownPeriod ? settleKey(record.prizeId, record.period) : null
+    if (
+      key &&
+      (settleCoordinator.isDone(key) ||
+        hasSettleFlag(storage, record.prizeId, record.period))
+    ) {
+      // 已生效（直报成功/标记已写）：直接出队，不重复上报。
+      continue
+    }
+    if (key && !settleCoordinator.tryBegin(key)) {
+      // 直报正在 in-flight：本轮跳过，留队列下轮再补。
+      remain.push(record)
+      continue
+    }
     try {
       await reportSettlement(record)
-      uni.setStorageSync(settleFlagKey(record.prizeId, record.period), 1)
+      if (key) {
+        storage.set(settleFlagKey(record.prizeId, record.period), '1')
+        settleCoordinator.succeed(key)
+      } else {
+        // 旧版无期次记录：补报成功写回旧式标记，保持旧语义。
+        storage.set(legacySettleFlagKey(record.prizeId), '1')
+      }
     } catch {
+      if (key) settleCoordinator.fail(key)
       remain.push(record)
     }
   }
@@ -281,6 +395,9 @@ async function onComplete(p: PrizeInfo): Promise<void> {
   // 状态机：ready → revealed；非法阶段（如已推进）直接忽略。
   if (streak.value.stage !== 'ready') return
   streak.value = { period, stage: 'revealed' }
+  // 断点续刮：揭晓即持久化，刷新/杀进程重进后本期不重刮、不重结算。
+  activityState.value = markPeriodRevealed(activityState.value, period, p.id)
+  persistActivityState()
 
   bumpCompleteCount(completeCounts.value, period)
   totalComplete.value++
@@ -296,22 +413,36 @@ async function onComplete(p: PrizeInfo): Promise<void> {
 
   // 前一张 Revealed 未结算完成前禁止发下一张：settleInFlight + 阶段守卫双保险。
   settleInFlight.value = true
-  const flagKey = settleFlagKey(p.id, period)
-  if (uni.getStorageSync(flagKey)) {
-    settleInFlight.value = false
-    cardRef.value?.markSettled()
-    scheduleNextAfterSettle()
+  const key = settleKey(p.id, period)
+  // 已生效（持久化标记 / 会话内已完成）：直接收尾，不重复上报、不重复入队。
+  if (hasSettleFlag(storage, p.id, period) || settleCoordinator.isDone(key)) {
+    finishSettleLocally(period)
     return
   }
 
   const record: SettleRecord = { prizeId: p.id, period, ts: Date.now() }
+  // 与补偿队列补报互斥：同一 (prizeId, 期次) 恰好生效一次。
+  if (!settleCoordinator.tryBegin(key)) {
+    writeQueue(enqueueSettleRecord(readQueue(), record))
+    finishSettleLocally(period)
+    return
+  }
   try {
     await reportSettlement(record)
-    uni.setStorageSync(flagKey, 1)
+    storage.set(settleFlagKey(p.id, period), '1')
+    settleCoordinator.succeed(key)
   } catch {
+    settleCoordinator.fail(key)
     // 上报失败：写期次级补偿队列，onShow/网络恢复时按期补报（不回滚视觉，仍进 Settled）。
     writeQueue(enqueueSettleRecord(readQueue(), record))
   }
+  finishSettleLocally(period)
+}
+
+/** 结算本地收尾：持久化 settled → 解锁 → Settled → 排期下一张。 */
+function finishSettleLocally(period: number): void {
+  activityState.value = markPeriodSettled(activityState.value, period)
+  persistActivityState()
   settleInFlight.value = false
   cardRef.value?.markSettled()
   scheduleNextAfterSettle()
