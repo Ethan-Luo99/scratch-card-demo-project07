@@ -214,3 +214,64 @@ export function shouldReveal(snapshot: GridSnapshot, threshold: number): boolean
     snapshot.cleanRatio >= Math.max(0, threshold - CLEAN_GUARD_GAP)
   )
 }
+
+/* ------------------------------------------------------------------ */
+/* onHide/onShow 进度保留：恢复路径决策（纯逻辑，可单测）             */
+/* ------------------------------------------------------------------ */
+
+/**
+ * 恢复策略（三级兜底）：
+ * - bitmap：onHide 位图可用，onShow drawImage 原样恢复（一级）；
+ * - replay：位图导出不可用（快照为 null），用内存网格圆点重放（二级）；
+ * - reset：导出/恢复失败或布局尺寸变化，静默重置为新卡（兜底）；
+ * - retain：画布未被回收且尺寸未变，位图仍在，直接续刮。
+ */
+export type ResumeStrategy = 'bitmap' | 'replay' | 'reset' | 'retain'
+
+export interface PausedSnapshot {
+  /** data URL / 临时文件路径；null 表示导出能力不可用（可走 replay） */
+  bitmap: string | null
+  /** exportBitmap 自身执行失败：只能静默 reset，不再尝试 replay */
+  exportFailed: boolean
+}
+
+export interface ResumeDecisionInput {
+  /** onHide 时捕获的位图快照；null 表示 onHide 未发生/已消费 */
+  snapshot: PausedSnapshot | null
+  /** onShow 重查后画布节点是否存活（被系统回收） */
+  surfaceAlive: boolean
+  /** 布局尺寸是否变化（旋转/分屏，旧网格坐标失效） */
+  sizeChanged: boolean
+}
+
+export function decideResumeStrategy(input: ResumeDecisionInput): ResumeStrategy {
+  if (input.sizeChanged) return 'reset'
+  if (input.surfaceAlive && !input.snapshot) return 'retain'
+  if (!input.surfaceAlive) {
+    if (!input.snapshot) return 'replay'
+    if (input.snapshot.exportFailed) return 'reset'
+    if (input.snapshot.bitmap) return 'bitmap'
+    return 'replay'
+  }
+  // 节点存活但带快照（一般只在强制调试回收分支出现）：位图仍在，直接续刮。
+  return 'retain'
+}
+
+/**
+ * 恢复后揭晓守卫（防止二级兜底的网格圆点重放把可疑格放大擦净后误触发揭晓）：
+ * - bitmap：逐像素恢复，读到的比例与刮动时一致，正常双守卫判定；
+ * - replay：网格圆点是「近似重建」，保守起见在用户下一笔之前不允许自动揭晓
+ *   （用户继续刮动产生新擦除后恢复正常判定）；
+ * - reset：全新涂层 ratio=0，本就不可能揭晓。
+ */
+export type ResumeMode = 'bitmap' | 'replay' | 'reset' | 'none'
+
+export function guardedShouldReveal(
+  snapshot: GridSnapshot,
+  threshold: number,
+  resumeMode: ResumeMode,
+  userErasedAfterResume: boolean,
+): boolean {
+  if (resumeMode === 'replay' && !userErasedAfterResume) return false
+  return shouldReveal(snapshot, threshold)
+}

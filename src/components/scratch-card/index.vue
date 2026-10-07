@@ -108,10 +108,52 @@ const card = useScratchCard({
   disabled: disabledRef,
   prize: prizeRef,
   getInstance: () => instance?.proxy,
+  // H5 自测：?scenario=exportFail / restoreFail 验证静默降级（真实接入时移除）。
+  debugExportFail: () => {
+    // #ifdef H5
+    return readDebugScenario() === 'exportFail'
+    // #endif
+    // #ifndef H5
+    return false
+    // #endif
+  },
+  debugNoBitmap: () => {
+    // #ifdef H5
+    return readDebugScenario() === 'noBitmap'
+    // #endif
+    // #ifndef H5
+    return false
+    // #endif
+  },
+  debugRestoreFail: () => {
+    // #ifdef H5
+    return readDebugScenario() === 'restoreFail'
+    // #endif
+    // #ifndef H5
+    return false
+    // #endif
+  },
   onProgress: (r) => emit('progress', r),
   onScratchStart: () => emit('scratch-start'),
   onComplete: (p) => emit('complete', p),
 })
+
+// #ifdef H5
+function readDebugScenario(): string {
+  try {
+    const fromSearch = new URL(window.location.href).searchParams.get('scenario')
+    if (fromSearch) return fromSearch
+    const hash = window.location.hash || ''
+    const qIndex = hash.indexOf('?')
+    if (qIndex >= 0) {
+      return new URLSearchParams(hash.slice(qIndex + 1)).get('scenario') || ''
+    }
+  } catch {
+    /* ignore */
+  }
+  return ''
+}
+// #endif
 
 onMounted(() => {
   void card.init()

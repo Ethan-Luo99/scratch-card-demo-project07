@@ -130,6 +130,20 @@ export interface CanvasSurface {
   sampleGrid(cols: number, rows: number): Uint8ClampedArray
   /** 整幅清空（fade 由组件用 CSS opacity 驱动；旧内核可直接隐藏节点） */
   revealAll(): void
+  /**
+   * onHide 位图导出（进度保留一级方案）：
+   * - H5：canvas.toDataURL()，返回 data URL；
+   * - MP-WEIXIN / APP-PLUS 2D 节点：wx.canvasToTempFilePath({canvas})，返回临时文件路径；
+   * - APP-PLUS 旧内核：uni.canvasToTempFilePath({canvasId})。
+   * 导出能力不可用时返回 null（调用方降级为网格圆点重放）；
+   * 调用本身失败由调用方静默降级为「重置为新卡」。
+   */
+  exportBitmap(): Promise<string | null>
+  /**
+   * onShow 位图恢复：把 exportBitmap 的产物整幅 drawImage 回物理画布。
+   * 返回 false 表示恢复失败/不可用（调用方静默降级，不报错、不留脏状态）。
+   */
+  restoreBitmap(snapshot: string): Promise<boolean>
   /** App 旧内核 createCanvasContext 回退分支标记（揭晓时需隐藏原生节点） */
   readonly legacy?: boolean
   /** rAF：MP 2D 用 node.requestAnimationFrame，H5 用全局 rAF，回退 setTimeout(16) */

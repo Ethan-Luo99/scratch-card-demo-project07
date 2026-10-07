@@ -19,6 +19,8 @@ import {
   CELL_COVERED,
   CELL_FUZZY,
   createScratchEngine,
+  decideResumeStrategy,
+  guardedShouldReveal,
   shouldReveal,
 } from '../src/components/scratch-card/scratchEngine.ts'
 
@@ -219,4 +221,114 @@ test('reset：网格清零、ratio 归零、笔画结束', () => {
   assert.equal(engine.cleanRatio, 0)
   assert.equal(engine.cells.every((c) => c === CELL_COVERED), true)
   assert.equal(engine.feedPoint({ x: 10, y: 10 }), null)
+})
+
+/* ---------- onHide/onShow 进度保留：恢复策略决策（纯逻辑） ---------- */
+
+test('恢复决策：节点存活且尺寸未变 → retain 直接续刮', () => {
+  assert.equal(
+    decideResumeStrategy({ snapshot: null, surfaceAlive: true, sizeChanged: false }),
+    'retain',
+  )
+  assert.equal(
+    decideResumeStrategy({
+      snapshot: { bitmap: 'x', exportFailed: false },
+      surfaceAlive: true,
+      sizeChanged: false,
+    }),
+    'retain',
+  )
+})
+
+test('恢复决策：尺寸变化恒为 reset（旧网格坐标失效，等同换卡）', () => {
+  for (const snapshot of [
+    null,
+    { bitmap: 'data:', exportFailed: false },
+    { bitmap: null, exportFailed: false },
+    { bitmap: null, exportFailed: true },
+  ]) {
+    assert.equal(
+      decideResumeStrategy({ snapshot, surfaceAlive: true, sizeChanged: true }),
+      'reset',
+    )
+    assert.equal(
+      decideResumeStrategy({ snapshot, surfaceAlive: false, sizeChanged: true }),
+      'reset',
+    )
+  }
+})
+
+test('恢复决策：节点被回收 + 位图可用 → bitmap 一级恢复', () => {
+  assert.equal(
+    decideResumeStrategy({
+      snapshot: { bitmap: 'data:image/png;base64,xxxx', exportFailed: false },
+      surfaceAlive: false,
+      sizeChanged: false,
+    }),
+    'bitmap',
+  )
+})
+
+test('恢复决策：节点被回收 + 导出能力不可用(null/未导出) → replay 二级兜底', () => {
+  assert.equal(
+    decideResumeStrategy({
+      snapshot: { bitmap: null, exportFailed: false },
+      surfaceAlive: false,
+      sizeChanged: false,
+    }),
+    'replay',
+  )
+  assert.equal(
+    decideResumeStrategy({ snapshot: null, surfaceAlive: false, sizeChanged: false }),
+    'replay',
+  )
+})
+
+test('恢复决策：导出本身失败 → 静默 reset，不再尝试 replay', () => {
+  assert.equal(
+    decideResumeStrategy({
+      snapshot: { bitmap: null, exportFailed: true },
+      surfaceAlive: false,
+      sizeChanged: false,
+    }),
+    'reset',
+  )
+})
+
+test('恢复后揭晓守卫：bitmap 恢复按正常双守卫判定，比例不回退、不误揭晓', () => {
+  const engine = makeEngine()
+  const total = COLS * ROWS
+  const values = new Array(total).fill(255)
+  for (let i = 0; i < 6; i++) values[i] = 0 // 约 1.7%，远低于阈值
+  const snap = engine.applySamples(alphaData(values), fullRect)
+  // bitmap 恢复：读到刮开后的像素，ratio 保持，不揭晓但也不回退。
+  assert.equal(guardedShouldReveal(snap, 0.5, 'bitmap', true), false)
+  assert.ok(engine.ratio > 0)
+
+  // 构造一张「恰好达标」快照：bitmap 模式即使无后续擦除也允许揭晓。
+  const valuesReveal = new Array(total).fill(255)
+  const cleanN = Math.ceil(total * 0.46)
+  for (let i = 0; i < cleanN; i++) valuesReveal[i] = 0
+  for (let i = cleanN; i < total; i++) valuesReveal[i] = 60
+  const snapReveal = engine.applySamples(alphaData(valuesReveal), fullRect)
+  assert.equal(guardedShouldReveal(snapReveal, 0.5, 'bitmap', false), true)
+})
+
+test('恢复后揭晓守卫：replay 重放后首次采样即使比例达标也不自动揭晓，用户再刮一笔后恢复', () => {
+  const engine = makeEngine()
+  const total = COLS * ROWS
+  // 先在内存网格积累到达标（刮动中切后台）。
+  const values = new Array(total).fill(255)
+  const cleanN = Math.ceil(total * 0.46)
+  for (let i = 0; i < cleanN; i++) values[i] = 0
+  for (let i = cleanN; i < total; i++) values[i] = 60
+  const snap = engine.applySamples(alphaData(values), fullRect)
+  assert.ok(shouldReveal(snap, 0.5))
+  // replay 刚恢复、用户尚未补刮：禁止揭晓（防圆点放大擦净误触发）。
+  assert.equal(guardedShouldReveal(snap, 0.5, 'replay', false), false)
+  // 用户补刮一笔后恢复正常判定。
+  assert.equal(guardedShouldReveal(snap, 0.5, 'replay', true), true)
+  // reset / none 模式不受守卫影响（reset 全新涂层本就不可能达标）。
+  assert.equal(guardedShouldReveal(snap, 0.5, 'reset', false), true)
+  assert.equal(guardedShouldReveal(snap, 0.5, 'none', false), true)
 })

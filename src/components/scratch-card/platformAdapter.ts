@@ -71,6 +71,8 @@ interface NodeSurfaceInjects {
   /** 创建 cols×rows 离屏画布；返回 null 时采样降级为全幅读取 + JS 区域平均 */
   createDownscaleCanvas(): { canvas: unknown; ctx: Ctx2D } | null
   loadImage(src: string): Promise<CanvasImageSource>
+  /** MP-WEIXIN / APP-PLUS 2D：wx.canvasToTempFilePath({canvas})；H5 不注入 */
+  exportCanvas?(canvas: unknown): Promise<string | null>
   scheduleFrame(cb: (time: number) => void): number
   cancelFrame(handle: number): void
 }
@@ -194,6 +196,50 @@ function createNodeSurface(
       if (autoScale) ctx.scale(dpr, dpr)
     },
 
+    async exportBitmap(): Promise<string | null> {
+      if (injects.exportCanvas) {
+        try {
+          return await injects.exportCanvas(canvas)
+        } catch {
+          // 导出失败：交由编排层静默降级（重置为新卡）。
+          throw new Error('export bitmap failed')
+        }
+      }
+      // H5：标准 toDataURL（页面同源、无跨域贴图，无 tainted 风险）。
+      const el = canvas as unknown as { toDataURL?: () => string }
+      if (typeof el.toDataURL === 'function') {
+        return el.toDataURL()
+      }
+      return null
+    },
+
+    async restoreBitmap(snapshot: string): Promise<boolean> {
+      try {
+        const img = await injects.loadImage(snapshot)
+        ctx.globalCompositeOperation = 'source-over'
+        ctx.globalAlpha = 1
+        // MP/App 2D（autoScale）：取消 dpr scale，用物理像素整幅覆盖；
+        // H5（autoScale=false）：uni hidpi 补丁会自动 ×pixelRatio，
+        // 与 paintCover 一致使用逻辑坐标，禁止 setTransform，否则只恢复左上 1/dpr 块。
+        if (autoScale) {
+          const nodeAny = canvas as unknown as { width: number; height: number }
+          const drawW = nodeAny.width || Math.round(w * dpr)
+          const drawH = nodeAny.height || Math.round(h * dpr)
+          ctx.setTransform(1, 0, 0, 1, 0, 0)
+          ctx.clearRect(0, 0, drawW, drawH)
+          ctx.drawImage(img, 0, 0, drawW, drawH)
+          ctx.scale(dpr, dpr)
+        } else {
+          ctx.clearRect(0, 0, w, h)
+          ctx.drawImage(img, 0, 0, w, h)
+        }
+        ctx.globalCompositeOperation = 'destination-out'
+        return true
+      } catch {
+        return false
+      }
+    },
+
     scheduleFrame(cb: (time: number) => void): number {
       return injects.scheduleFrame(cb)
     },
@@ -297,6 +343,26 @@ function mountFromNode(
       })
     },
 
+    // MP-WEIXIN / APP-PLUS 2D：导出当前位图临时文件（onHide 进度保留）。
+    exportCanvas(): Promise<string | null> {
+      const wxApi = (globalThis as { wx?: WxCanvasToTempFileApi }).wx
+      const caller: WxCanvasToTempFileApi | undefined =
+        typeof wxApi?.canvasToTempFilePath === 'function'
+          ? wxApi
+          : (uni as unknown as { canvasToTempFilePath?: WxCanvasToTempFileApi['canvasToTempFilePath'] })
+                .canvasToTempFilePath
+            ? (uni as unknown as WxCanvasToTempFileApi)
+            : undefined
+      if (!caller) return Promise.resolve(null)
+      return new Promise((resolve, reject) => {
+        caller.canvasToTempFilePath({
+          canvas: node,
+          success: (res: { tempFilePath: string }) => resolve(res.tempFilePath),
+          fail: () => reject(new Error('canvasToTempFilePath failed')),
+        }, opts.instance)
+      })
+    },
+
     // R13：优先节点 rAF，不存在则 setTimeout(16) 兜底；禁止 window.rAF 进入小程序。
     scheduleFrame(cb: (time: number) => void): number {
       const raf = node.requestAnimationFrame
@@ -327,6 +393,15 @@ function mountFromNode(
 /* ------------------------------------------------------------------ */
 /* App 旧内核回退 surface（uni.createCanvasContext，R14）              */
 /* ------------------------------------------------------------------ */
+
+type WxCanvasToTempFileApi = {
+  canvasToTempFilePath: (opts: {
+    canvas?: unknown
+    canvasId?: string
+    success?: (res: { tempFilePath: string }) => void
+    fail?: () => void
+  }, instance?: unknown) => void
+}
 
 // #ifdef APP-PLUS
 function createLegacySurface(canvasId: string, opts: MountOpts, instance: unknown): CanvasSurface {
@@ -455,6 +530,46 @@ function createLegacySurface(canvasId: string, opts: MountOpts, instance: unknow
       triggerRead()
       // 旧接口读取是异步回调：返回上一帧缓存（首帧为全不透明），下一帧生效。
       return cache
+    },
+    exportBitmap(): Promise<string | null> {
+      const api = uni as unknown as {
+        canvasToTempFilePath?: (
+          o: {
+            canvasId: string
+            success?: (r: { tempFilePath: string }) => void
+            fail?: () => void
+          },
+          inst?: unknown,
+        ) => void
+      }
+      if (typeof api.canvasToTempFilePath !== 'function') {
+        return Promise.resolve(null)
+      }
+      return new Promise((resolve, reject) => {
+        api.canvasToTempFilePath!(
+          {
+            canvasId,
+            success: (r) => resolve(r.tempFilePath),
+            fail: () => reject(new Error('legacy canvasToTempFilePath failed')),
+          },
+          instance,
+        )
+      })
+    },
+    async restoreBitmap(snapshot: string): Promise<boolean> {
+      // 旧内核：临时文件可直接作为 drawImage 源。
+      try {
+        await new Promise<void>((resolve) => {
+          ctx.drawImage(snapshot as unknown as CanvasImageSource, 0, 0, w, h)
+          ;(ctx as unknown as { draw: (reserve: boolean, cb?: () => void) => void }).draw(
+            false,
+            () => resolve(),
+          )
+        })
+        return true
+      } catch {
+        return false
+      }
     },
     revealAll(): void {
       ctx.clearRect(0, 0, w, h)
